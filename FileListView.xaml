@@ -23,7 +23,7 @@
             <local:FileToIconConverter x:Key="FileToIconConverter" />
 
             <!-- Template for directory information at all levels -->
-            <HierarchicalDataTemplate ItemsSource="{Binding Children.Keys}"
+            <HierarchicalDataTemplate ItemsSource="{Binding ChildrenSorted}"
                                       DataType="{x:Type local:FileEntry}">
                 <Grid>
                     <Grid.RowDefinitions>

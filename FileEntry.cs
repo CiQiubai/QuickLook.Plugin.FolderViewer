@@ -17,23 +17,90 @@
 
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using QuickLook.Common.Annotations;
 
 namespace QuickLook.Plugin.FolderViewer
 {
-    public class FileEntry : IComparable<FileEntry>
+    public class FileEntry : IComparable<FileEntry>, INotifyPropertyChanged
     {
-        private readonly FileEntry _parent;
+        private readonly List<FileEntry> _children = new List<FileEntry>();
+        private bool _isLoaded;
+        private bool? _hasSubItems;
 
-        public FileEntry(string name, bool isFolder, FileEntry parent = null)
+        /// <summary>
+        ///     Placeholder entry shown as a child of unloaded directories to make the expand arrow appear.
+        /// </summary>
+        public static readonly FileEntry Placeholder = new FileEntry("Loading...", false);
+
+        public FileEntry(string name, bool isFolder)
         {
             Name = name;
             IsFolder = isFolder;
-
-            _parent = parent;
-            _parent?.Children.Add(this, false);
         }
 
-        public SortedList<FileEntry, bool> Children { get; set; } = new SortedList<FileEntry, bool>();
+        /// <summary>
+        ///     Internal mutable list. Use <see cref="ChildrenSorted" /> for binding.
+        /// </summary>
+        public List<FileEntry> Children => _children;
+
+        /// <summary>
+        ///     Returns a sorted, read-only view of children (folders first, then alphabetical).
+        ///     Rebuilt every time it is accessed to reflect the latest list state.
+        /// </summary>
+        public ReadOnlyCollection<FileEntry> ChildrenSorted
+        {
+            get
+            {
+                if (_children.Count == 0)
+                    return null;
+
+                _children.Sort();
+                return _children.AsReadOnly();
+            }
+        }
+
+        /// <summary>
+        ///     Whether sub-directory contents have already been loaded.
+        /// </summary>
+        public bool IsLoaded
+        {
+            get => _isLoaded;
+            set
+            {
+                if (_isLoaded == value)
+                    return;
+                _isLoaded = value;
+                OnPropertyChanged();
+            }
+        }
+
+        /// <summary>
+        ///     Whether this directory has any sub-items (files or folders).
+        ///     <c>null</c> means not yet probed.
+        /// </summary>
+        public bool? HasSubItems
+        {
+            get => _hasSubItems;
+            set
+            {
+                if (_hasSubItems == value)
+                    return;
+                _hasSubItems = value;
+                OnPropertyChanged();
+            }
+        }
+
+        /// <summary>
+        ///     Notifies the UI that <see cref="ChildrenSorted" /> has changed.
+        /// </summary>
+        public void NotifyChildrenChanged()
+        {
+            OnPropertyChanged(nameof(ChildrenSorted));
+        }
 
         public string Name { get; set; }
         public bool IsFolder { get; set; }
@@ -41,8 +108,25 @@ namespace QuickLook.Plugin.FolderViewer
         public DateTime ModifiedDate { get; set; }
         public string FullPath { get; set; }
 
+        public event PropertyChangedEventHandler PropertyChanged;
+
+        [NotifyPropertyChangedInvocator]
+        protected virtual void OnPropertyChanged([CallerMemberName] string propertyName = null)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        }
+
         public int CompareTo(FileEntry other)
         {
+            if (other == null)
+                return 1;
+
+            // Placeholder always sorts last
+            if (ReferenceEquals(this, Placeholder))
+                return 1;
+            if (ReferenceEquals(other, Placeholder))
+                return -1;
+
             if (IsFolder == other.IsFolder)
                 return string.Compare(Name, other.Name, StringComparison.CurrentCulture);
 

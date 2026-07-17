@@ -20,6 +20,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Controls;
 using QuickLook.Common.Annotations;
@@ -32,7 +33,8 @@ namespace QuickLook.Plugin.FolderViewer
     /// </summary>
     public partial class FolderInfoPanel : UserControl, IDisposable, INotifyPropertyChanged
     {
-        private readonly Dictionary<string, FileEntry> _fileEntries = new Dictionary<string, FileEntry>();
+        private readonly Dictionary<string, FileEntry> _fileEntries = new Dictionary<string, FileEntry>(StringComparer.OrdinalIgnoreCase);
+        private CancellationTokenSource _cts = new CancellationTokenSource();
         private bool _disposed;
         private double _loadPercent;
         private bool _stop;
@@ -44,8 +46,13 @@ namespace QuickLook.Plugin.FolderViewer
             // design-time only
             Resources.MergedDictionaries.Clear();
 
+            // Wire up lazy-loading callback: when the user expands a directory node,
+            // FileListView will call back into this method.
+            fileListView.LoadSubDirectoryRequested += LoadSubDirectory;
+
             BeginLoadDirectory(path);
         }
+
         public bool Stop
         {
             set => _stop = value;
@@ -57,7 +64,8 @@ namespace QuickLook.Plugin.FolderViewer
             get => _loadPercent;
             private set
             {
-                if (value == _loadPercent) return;
+                if (Math.Abs(value - _loadPercent) < 0.001)
+                    return;
                 _loadPercent = value;
                 OnPropertyChanged();
             }
@@ -68,8 +76,14 @@ namespace QuickLook.Plugin.FolderViewer
             GC.SuppressFinalize(this);
 
             _disposed = true;
+            _cts?.Cancel();
+            _cts?.Dispose();
+            _cts = null;
 
-            fileListView.Dispose();
+            if (fileListView != null)
+                fileListView.LoadSubDirectoryRequested -= LoadSubDirectory;
+
+            fileListView?.Dispose();
         }
 
         public event PropertyChangedEventHandler PropertyChanged;
@@ -78,23 +92,29 @@ namespace QuickLook.Plugin.FolderViewer
         {
             new Task(() =>
             {
-                var root = new FileEntry(Path.GetDirectoryName(path), true);
-                _fileEntries.Add(path, root);
+                // Create root entry for the directory itself
+                var root = new FileEntry(Path.GetFileName(path), true)
+                {
+                    FullPath = path,
+                    IsLoaded = true
+                };
+                _fileEntries[path] = root;
 
-                LoadItemsFromFolder(path, ref _stop,
-                    out var totalDirsL, out var totalFilesL, out var totalSizeL);
+                // Load only the first level
+                LoadSingleLevel(path, root, _cts.Token, out var totalDirsL, out var totalFilesL, out var totalSizeL);
 
                 Dispatcher.Invoke(() =>
                 {
                     if (_disposed)
                         return;
 
-                    fileListView.SetDataContext(_fileEntries[path].Children.Keys);
+                    // Set data context to root's sorted children
+                    fileListView.SetDataContext(root.ChildrenSorted);
                     totalSize.Content =
                         $"Total size: {totalSizeL.ToPrettySize(2)}";
                     numFolders.Content =
                         $"Folders: {totalDirsL}";
-                    numFiles.Content = 
+                    numFiles.Content =
                         $"Files: {totalFilesL}";
                 });
 
@@ -102,69 +122,142 @@ namespace QuickLook.Plugin.FolderViewer
             }).Start();
         }
 
-        // based on InfoPanel.FileHelper.CountFolder
-        public void LoadItemsFromFolder(string root, ref bool stop, out long totalDirs, out long totalFiles,
-    out long totalSize)
+        /// <summary>
+        ///     Loads the immediate children (files + sub-directories) of a single directory.
+        ///     Does NOT recurse into sub-directories; instead places a placeholder in each
+        ///     sub-directory so the TreeView shows an expand arrow.
+        /// </summary>
+        private void LoadSingleLevel(string dirPath, FileEntry parentEntry, CancellationToken ct,
+            out long totalDirs, out long totalFiles, out long totalSize)
         {
             totalDirs = totalFiles = totalSize = 0L;
 
-            var stack = new Stack<DirectoryInfo>();
-            stack.Push(new DirectoryInfo(root));
+            var childDirs = new List<FileEntry>();
+            var childFiles = new List<FileEntry>();
 
-            do
+            try
             {
-                if (stop)
-                    break;
+                var dirInfo = new DirectoryInfo(dirPath);
 
-                var pos = stack.Pop();
-
-                try
+                // Process files
+                foreach (var file in dirInfo.EnumerateFiles())
                 {
-                    _fileEntries.TryGetValue(pos.FullName, out var fileParent);
+                    if (ct.IsCancellationRequested || _stop)
+                        break;
 
-                    // process files in current directory
-                    foreach (var file in pos.EnumerateFiles())
+                    totalFiles++;
+                    totalSize += file.Length;
+
+                    var fe = new FileEntry(file.Name, false)
                     {
-                        totalFiles++;
-                        totalSize += file.Length;
+                        Size = (ulong)file.Length,
+                        ModifiedDate = file.LastWriteTime,
+                        FullPath = file.FullName
+                    };
+                    _fileEntries[file.FullName] = fe;
+                    childFiles.Add(fe);
+                }
 
-                        _fileEntries.Add(file.FullName, new FileEntry(file.Name, false, fileParent)
-                        {
-                            Size = (ulong)file.Length,
-                            ModifiedDate = file.LastWriteTime,
-                            FullPath = file.FullName
-                        }); ;
-
-                    }
-
-                    // then push all sub-directories
-                    foreach (var dir in pos.EnumerateDirectories())
+                // Process sub-directories
+                if (!ct.IsCancellationRequested && !_stop)
+                {
+                    foreach (var dir in dirInfo.EnumerateDirectories())
                     {
+                        if (ct.IsCancellationRequested || _stop)
+                            break;
+
                         totalDirs++;
-                        stack.Push(dir);
 
-                        _fileEntries.TryGetValue(GetDirectoryName(dir.FullName), out var parent);
-
-                        var afe = new FileEntry(dir.Name, true, parent)
+                        var fe = new FileEntry(dir.Name, true)
                         {
                             FullPath = dir.FullName
                         };
-                        _fileEntries.Add(dir.FullName, afe);
+                        _fileEntries[dir.FullName] = fe;
+
+                        // Probe whether the sub-directory has any children (fast check)
+                        fe.HasSubItems = HasAnyChild(dir.FullName);
+
+                        if (fe.HasSubItems == true)
+                        {
+                            // Add a placeholder so TreeView shows an expand arrow
+                            fe.Children.Add(FileEntry.Placeholder);
+                        }
+
+                        childDirs.Add(fe);
                     }
                 }
-                catch (Exception)
-                {
-                    totalDirs++;
-                    //pos = stack.Pop();
-                }
-            } while (stack.Count != 0);
+            }
+            catch (Exception)
+            {
+                totalDirs++;
+            }
+
+            // Batch-add to parent: folders first, then files, then sort
+            parentEntry.Children.AddRange(childDirs);
+            parentEntry.Children.AddRange(childFiles);
+            parentEntry.Children.Sort();
         }
 
-        private string GetDirectoryName(string path)
+        /// <summary>
+        ///     Called by <see cref="FileListView" /> when the user expands a TreeViewItem
+        ///     representing a sub-directory that hasn't been loaded yet.
+        /// </summary>
+        public void LoadSubDirectory(FileEntry dirEntry)
         {
-            var d = Path.GetDirectoryName(path);
+            if (_disposed || _stop || dirEntry == null || dirEntry.IsLoaded)
+                return;
 
-            return d ?? "";
+            if (!dirEntry.IsFolder)
+                return;
+
+            // Mark as loaded immediately to prevent duplicate calls
+            // from rapid expand/collapse/expand sequences.
+            dirEntry.IsLoaded = true;
+
+            // Cancel any pending load to avoid concurrent loads
+            _cts?.Cancel();
+            _cts = new CancellationTokenSource();
+            var ct = _cts.Token;
+
+            new Task(() =>
+            {
+                if (ct.IsCancellationRequested || _stop)
+                    return;
+
+                LoadSingleLevel(dirEntry.FullPath, dirEntry, ct, out _, out _, out _);
+
+                if (_disposed || _stop || ct.IsCancellationRequested)
+                    return;
+
+                Dispatcher.Invoke(() =>
+                {
+                    if (_disposed || _stop)
+                        return;
+
+                    // Remove placeholder and notify UI
+                    dirEntry.Children.Remove(FileEntry.Placeholder);
+                    dirEntry.NotifyChildrenChanged();
+                });
+            }).Start();
+        }
+
+        /// <summary>
+        ///     Quickly checks whether a directory has any files or sub-directories.
+        ///     Uses early-exit: returns true as soon as the first entry is found.
+        /// </summary>
+        private static bool HasAnyChild(string dirPath)
+        {
+            try
+            {
+                using (var enumerator = Directory.EnumerateFileSystemEntries(dirPath).GetEnumerator())
+                {
+                    return enumerator.MoveNext();
+                }
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         [NotifyPropertyChangedInvocator]

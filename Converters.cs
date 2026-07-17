@@ -221,10 +221,18 @@ namespace QuickLook.Plugin.FolderViewer
 
         public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
         {
-            var fullPath = (string)values[0];
+            if (values == null || values.Length == 0 || values[0] == null)
+                return Binding.DoNothing;
+
+            var fullPath = values[0] as string;
+            if (string.IsNullOrEmpty(fullPath))
+                return Binding.DoNothing;
 
             // HBitmap to BitmapSource - See https://stackoverflow.com/a/35274172
             var bitmapHandle = GetHBitmap(fullPath, 16, 16, ThumbnailOptions.None);
+            if (bitmapHandle == IntPtr.Zero)
+                return Binding.DoNothing;
+
             try
             {
                 return Imaging.CreateBitmapSourceFromHBitmap(bitmapHandle, IntPtr.Zero, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
